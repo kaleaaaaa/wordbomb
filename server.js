@@ -59,11 +59,16 @@ function buildDictionary(text) {
 
   // Only use fragments that plenty of words contain, then split by how common
   // they are: the most common are "easy", the rarest "hard".
-  const minCount = Math.max(2, Math.min(24, Math.floor(words.size / 15000)));
-  const frags = [...counts].filter(([, c]) => c >= minCount).sort((a, b) => b[1] - a[1]);
+  // Big word lists are full of obscure words, so a rare fragment can still
+  // appear in a few dozen of them and feel random. Require a fragment to show up
+  // in at least ~0.04% of all words (about 150 words on a 370k list). Override
+  // with the MIN_FRAG env var: higher = friendlier prompts, lower = weirder.
+  const minCount = Number(process.env.MIN_FRAG) || Math.max(3, Math.floor(words.size / 2500));
+  let frags = [...counts].filter(([, c]) => c >= minCount).sort((a, b) => b[1] - a[1]);
+  if (frags.length < 20) frags = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 200); // tiny word lists
   const n = frags.length;
-  const cut1 = Math.ceil(n * 0.25);
-  const cut2 = Math.ceil(n * 0.65);
+  const cut1 = Math.ceil(n * 0.3);
+  const cut2 = Math.ceil(n * 0.7);
   const names = (arr) => arr.map((f) => f[0]);
   return {
     words,
