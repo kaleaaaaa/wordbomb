@@ -27,8 +27,8 @@ const WORDS_URL =
 const CONFIG = {
   MAX_PLAYERS: 8,
   BOOM_MS: 2200, // pause after an explosion before the next bomb
-  MIN_PASS_MS: 2500, // a bomb passed on always gives the next player at least this long
-  FUSES: { fast: [5, 10], normal: [7, 15], slow: [12, 25] }, // seconds, random per bomb
+  MIN_PASS_MS: 2500, // (unused now: every pass gets a full fresh fuse)
+  FUSES: { fast: [4, 8], normal: [6, 12], slow: [10, 18] }, // seconds, random per turn (resets on every pass)
   // Using all of these letters across your words earns a life back (no Q, X, Z).
   BONUS_LETTERS: 'abcdefghijklmnoprstuvwy',
   MAX_LIVES: 5,
@@ -244,20 +244,25 @@ function createGame(io, dict) {
     room.timer = setTimeout(() => explode(room), ms);
   }
 
-  function startRound(room, idx) {
+  // Every turn gets a fresh random fuse, so the timer resets whenever the bomb is passed.
+  function freshFuse(room) {
     const [lo, hi] = CONFIG.FUSES[room.settings.fuse] || CONFIG.FUSES.normal;
+    room.fuseTotal = (lo + Math.random() * (hi - lo)) * 1000;
+    armFuse(room, room.fuseTotal);
+  }
+
+  function startRound(room, idx) {
     room.phase = 'playing';
     room.turn = idx;
     room.prompt = pickPrompt(room);
-    room.fuseTotal = (lo + Math.random() * (hi - lo)) * 1000;
-    armFuse(room, room.fuseTotal);
+    freshFuse(room);
     broadcast(room);
   }
 
   function passBomb(room, fromIdx) {
     room.turn = nextAlive(room, fromIdx);
     room.prompt = pickPrompt(room);
-    armFuse(room, Math.max(room.fuseEnd - Date.now(), CONFIG.MIN_PASS_MS));
+    freshFuse(room);
   }
 
   function explode(room) {
