@@ -10,12 +10,13 @@
  * this file and it will be used instead.
  *
  * Env vars: PORT (3000), ORIGIN ("*" or a comma-separated list of allowed
- * page origins, e.g. https://mysite.com), WORDS_FILE, WORDS_URL.
+ * page origins, e.g. https://mysite.com), WORDS_FILE, WORDS_URL, MIN_FRAG.
  */
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT) || 3000;
 const ORIGIN = process.env.ORIGIN || '*';
@@ -26,12 +27,15 @@ const WORDS_URL =
 
 const CONFIG = {
   MAX_PLAYERS: 8,
+  MAX_SPECTATORS: 30,
   BOOM_MS: 2200, // pause after an explosion before the next bomb
-  MIN_PASS_MS: 2500, // (unused now: every pass gets a full fresh fuse)
-  FUSES: { fast: [4, 8], normal: [6, 12], slow: [10, 18] }, // seconds, random per turn (resets on every pass)
+  FUSES: { fast: [4, 8], normal: [6, 12], slow: [10, 18] }, // seconds, fresh random fuse every turn
   // Using all of these letters across your words earns a life back (no Q, X, Z).
   BONUS_LETTERS: 'abcdefghijklmnoprstuvwy',
   MAX_LIVES: 5,
+  CHAT_KEEP: 60, // messages remembered per room
+  GRACE_IDLE_MS: 25000, // how long a dropped player can come back in a lobby
+  GRACE_GAME_MS: 60000, // ...and during a game
 };
 const DIFFICULTIES = ['easy', 'medium', 'hard', 'mixed'];
 
@@ -57,8 +61,6 @@ function buildDictionary(text) {
     for (const f of seen) counts.set(f, (counts.get(f) || 0) + 1);
   }
 
-  // Only use fragments that plenty of words contain, then split by how common
-  // they are: the most common are "easy", the rarest "hard".
   // Big word lists are full of obscure words, so a rare fragment can still
   // appear in a few dozen of them and feel random. Require a fragment to show up
   // in at least ~0.04% of all words (about 150 words on a 370k list). Override
@@ -129,12 +131,64 @@ function cleanName(s) {
   s = String(s == null ? '' : s).replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 16);
   return s || 'Player';
 }
+function cleanTitle(s, fallback) {
+  s = String(s == null ? '' : s).replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 28);
+  return s || fallback;
+}
+function cleanToken(s) {
+  s = String(s == null ? '' : s);
+  return /^[A-Za-z0-9_-]{16,64}$/.test(s) ? s : '';
+}
+function cleanChat(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+}
 
 function createGame(io, dict) {
   const rooms = new Map(); // code -> room
-  const roomOf = new Map(); // socket id -> room code
+  const sockRoom = new Map(); // socket id -> room code
+  const sessions = new Map(); // secret token -> room code (for reconnecting)
   const noop = () => {};
   const fn = (f) => (typeof f === 'function' ? f : noop);
+  const live = (room) => room.phase === 'playing' || room.phase === 'boom';
+
+  /* ---------- room list (the public lobby browser) ---------- */
+
+  let lastPub = '';
+  let pubTimer = null;
+  function listRooms() {
+    return [...rooms.values()]
+      .map((r) => {
+        const host = r.players.find((p) => p.id === r.hostId);
+        return {
+          code: r.code,
+          title: r.title,
+          host: host ? host.name : '',
+          players: active(r).length,
+          max: CONFIG.MAX_PLAYERS,
+          specs: r.specs.length,
+          phase: r.phase,
+          lives: r.settings.lives,
+        };
+      })
+      .sort((a, b) => (a.phase === 'lobby' ? 0 : 1) - (b.phase === 'lobby' ? 0 : 1) || b.players - a.players);
+  }
+  function publishRooms() {
+    if (pubTimer) return;
+    pubTimer = setTimeout(() => {
+      pubTimer = null;
+      const list = listRooms();
+      const json = JSON.stringify(list);
+      if (json === lastPub) return;
+      lastPub = json;
+      io.to('browse').emit('rooms', list);
+    }, 200);
+  }
+
+  /* ---------- helpers ---------- */
 
   function makeCode() {
     const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -145,13 +199,16 @@ function createGame(io, dict) {
     return c;
   }
 
-  function newRoom(code) {
+  function newRoom(code, title) {
     return {
       code,
+      title,
       hostId: null,
       phase: 'lobby', // lobby | playing | boom | over
       settings: { lives: 3, fuse: 'normal', difficulty: 'mixed' },
       players: [],
+      specs: [], // spectators: they join as players when the next game starts
+      chat: [],
       turn: -1,
       prompt: '',
       used: new Set(),
@@ -177,9 +234,11 @@ function createGame(io, dict) {
   }
 
   function snapshot(room) {
-    const holder = room.phase === 'playing' || room.phase === 'boom' ? room.players[room.turn] : null;
+    const inGame = live(room);
+    const holder = inGame ? room.players[room.turn] : null;
     return {
       code: room.code,
+      title: room.title,
       hostId: room.hostId,
       phase: room.phase,
       settings: room.settings,
@@ -189,11 +248,13 @@ function createGame(io, dict) {
         lives: p.lives,
         alive: p.alive,
         left: p.left,
+        offline: p.offline,
         words: p.words,
         letters: [...p.letters].join(''),
       })),
+      specs: room.specs.map((s) => ({ id: s.id, name: s.name, offline: s.offline })),
       turnId: holder ? holder.id : null,
-      prompt: room.phase === 'playing' || room.phase === 'boom' ? room.prompt : '',
+      prompt: inGame ? room.prompt : '',
       msLeft: room.phase === 'playing' ? Math.max(0, room.fuseEnd - Date.now()) : 0,
       fuseTotal: room.fuseTotal,
       winnerId: room.winnerId,
@@ -208,7 +269,17 @@ function createGame(io, dict) {
 
   function broadcast(room) {
     io.to(room.code).emit('state', snapshot(room));
+    publishRooms();
   }
+
+  function pushChat(room, m) {
+    room.chat.push(m);
+    if (room.chat.length > CONFIG.CHAT_KEEP) room.chat.shift();
+    io.to(room.code).emit('chat', m);
+  }
+  const sysChat = (room, text) => pushChat(room, { kind: 'sys', text, t: Date.now() });
+
+  /* ---------- turns, fuse, explosions ---------- */
 
   function nextAlive(room, from) {
     const n = room.players.length;
@@ -292,6 +363,8 @@ function createGame(io, dict) {
     broadcast(room);
   }
 
+  /* ---------- players and spectators ---------- */
+
   function resetPlayers(room) {
     room.players = room.players.filter((p) => !p.left);
     for (const p of room.players) {
@@ -302,7 +375,15 @@ function createGame(io, dict) {
     }
   }
 
+  // Spectators take a seat when there is room (called when a game starts or the room returns to the lobby).
+  function promoteSpecs(room) {
+    while (room.specs.length && active(room).length < CONFIG.MAX_PLAYERS) {
+      room.players.push(room.specs.shift());
+    }
+  }
+
   function startGame(room) {
+    promoteSpecs(room);
     resetPlayers(room);
     if (!room.players.length) return;
     room.used = new Set();
@@ -313,54 +394,105 @@ function createGame(io, dict) {
     startRound(room, Math.floor(Math.random() * room.players.length));
   }
 
+  function resetToLobby(room) {
+    clearTimeout(room.timer);
+    clearTimeout(room.nextTimer);
+    room.phase = 'lobby';
+    room.winnerId = null;
+    room.prompt = '';
+    promoteSpecs(room);
+    resetPlayers(room);
+    const first = active(room)[0];
+    if (!active(room).some((p) => p.id === room.hostId)) room.hostId = first ? first.id : null;
+  }
+
   function destroy(room) {
     clearTimeout(room.timer);
     clearTimeout(room.nextTimer);
     rooms.delete(room.code);
+    publishRooms();
   }
 
-  function addPlayer(room, socket, name) {
-    let base = cleanName(name);
+  function makeEntry(room, socket, name, token) {
+    const base = cleanName(name);
     let n = base;
     let i = 2;
-    while (active(room).some((p) => p.name.toLowerCase() === n.toLowerCase())) {
-      n = base.slice(0, 13) + ' ' + i++;
-    }
-    room.players.push({
-      id: socket.id,
+    const taken = (x) => active(room).concat(room.specs).some((p) => p.name.toLowerCase() === x.toLowerCase());
+    while (taken(n)) n = base.slice(0, 13) + ' ' + i++;
+    return {
+      id: crypto.randomBytes(4).toString('hex'), // public id (safe to show everyone)
+      token, // secret, only the owner knows it; used to reconnect
+      sid: socket.id,
       name: n,
+      offline: false,
+      graceTimer: null,
+      lastChat: 0,
+      lastSubmit: 0,
       lives: room.settings.lives,
       alive: room.phase !== 'over',
       letters: new Set(),
       words: 0,
       left: false,
-    });
-    if (!room.hostId) room.hostId = socket.id;
-    socket.join(room.code);
-    roomOf.set(socket.id, room.code);
+    };
   }
 
-  function leave(socket) {
-    const code = roomOf.get(socket.id);
-    roomOf.delete(socket.id);
-    const room = code && rooms.get(code);
-    if (!room) return;
-    socket.leave(code);
-    const idx = room.players.findIndex((p) => p.id === socket.id);
-    if (idx === -1) return;
-    const inGame = room.phase === 'playing' || room.phase === 'boom';
+  function attach(room, socket, entry, asSpec) {
+    (asSpec ? room.specs : room.players).push(entry);
+    if (!asSpec && !room.hostId) room.hostId = entry.id;
+    sessions.set(entry.token, room.code);
+    sockRoom.set(socket.id, room.code);
+    socket.leave('browse');
+    socket.join(room.code);
+    socket.emit('you', { id: entry.id, token: entry.token, code: room.code, spec: asSpec });
+    socket.emit('chat:history', room.chat.slice());
+    sysChat(room, entry.name + (asSpec ? ' is watching' : ' joined'));
+  }
 
+  function locate(socket) {
+    const room = rooms.get(sockRoom.get(socket.id));
+    if (!room) return {};
+    const player = room.players.find((p) => p.sid === socket.id);
+    if (player) return { room, player };
+    const spec = room.specs.find((p) => p.sid === socket.id);
+    return spec ? { room, spec } : {};
+  }
+
+  // Take a player or spectator out of a room for good.
+  function removeEntry(room, entry) {
+    clearTimeout(entry.graceTimer);
+    if (sessions.get(entry.token) === room.code) sessions.delete(entry.token);
+    if (entry.sid && sockRoom.get(entry.sid) === room.code) sockRoom.delete(entry.sid);
+    entry.sid = null;
+
+    if (room.specs.includes(entry)) {
+      room.specs = room.specs.filter((s) => s !== entry);
+      sysChat(room, entry.name + ' left');
+      return broadcast(room);
+    }
+    const idx = room.players.indexOf(entry);
+    if (idx === -1) return;
+    const inGame = live(room);
     if (inGame) {
-      room.players[idx].left = true;
-      room.players[idx].alive = false;
-      room.players[idx].lives = 0;
+      entry.left = true;
+      entry.alive = false;
+      entry.lives = 0;
     } else {
       room.players.splice(idx, 1);
     }
+    sysChat(room, entry.name + ' left');
 
-    if (active(room).length === 0) return destroy(room);
-    if (room.hostId === socket.id) room.hostId = active(room)[0].id;
-
+    if (active(room).length === 0) {
+      if (room.specs.length) {
+        resetToLobby(room); // the spectators become the new players
+        return broadcast(room);
+      }
+      return destroy(room);
+    }
+    if (room.hostId === entry.id) {
+      const next = active(room).find((p) => !p.offline) || active(room)[0];
+      room.hostId = next.id;
+    }
+    if (room.phase === 'lobby') promoteSpecs(room);
     if (room.phase === 'playing') {
       if (isOver(room)) return finish(room);
       if (idx === room.turn) passBomb(room, idx);
@@ -368,41 +500,117 @@ function createGame(io, dict) {
     broadcast(room);
   }
 
-  const roomFor = (socket) => rooms.get(roomOf.get(socket.id));
+  // Remove whoever this secret token currently is, wherever they are (used before joining something new).
+  function dropToken(token) {
+    const room = rooms.get(sessions.get(token));
+    sessions.delete(token);
+    if (!room) return;
+    const e = room.players.find((p) => p.token === token && !p.left) || room.specs.find((s) => s.token === token);
+    if (e) removeEntry(room, e);
+  }
+
+  function leave(socket) {
+    const { room, player, spec } = locate(socket);
+    const entry = player || spec;
+    if (!entry) return;
+    socket.leave(room.code);
+    removeEntry(room, entry);
+    socket.join('browse');
+    socket.emit('rooms', listRooms());
+  }
+
+  // Connection dropped: keep their seat for a while so they can come back.
+  function goOffline(socket) {
+    const { room, player, spec } = locate(socket);
+    sockRoom.delete(socket.id);
+    const entry = player || spec;
+    if (!entry) return;
+    entry.sid = null;
+    entry.offline = true;
+    clearTimeout(entry.graceTimer);
+    entry.graceTimer = setTimeout(() => {
+      if (rooms.has(room.code) && entry.offline) removeEntry(room, entry);
+    }, live(room) ? CONFIG.GRACE_GAME_MS : CONFIG.GRACE_IDLE_MS);
+    if (player && room.hostId === entry.id) {
+      const other = active(room).find((p) => !p.offline && p !== entry);
+      if (other) room.hostId = other.id;
+    }
+    broadcast(room);
+  }
+
   const hostRoom = (socket) => {
-    const r = roomFor(socket);
-    return r && r.hostId === socket.id ? r : null;
+    const { room, player } = locate(socket);
+    return room && player && room.hostId === player.id ? room : null;
   };
 
+  /* ---------- socket events ---------- */
+
   io.on('connection', (socket) => {
+    socket.join('browse');
+    socket.emit('rooms', listRooms());
+
+    socket.on('rooms:list', () => socket.emit('rooms', listRooms()));
+
     socket.on('room:create', (data, ack) => {
       const reply = fn(ack);
+      data = data || {};
+      const token = cleanToken(data.token) || crypto.randomBytes(12).toString('hex');
       leave(socket);
-      const room = newRoom(makeCode());
+      dropToken(token);
+      const name = cleanName(data.name);
+      const room = newRoom(makeCode(), cleanTitle(data.title, name + "'s room"));
       rooms.set(room.code, room);
-      addPlayer(room, socket, data && data.name);
+      attach(room, socket, makeEntry(room, socket, name, token), false);
       reply({ ok: true, code: room.code });
       broadcast(room);
     });
 
     socket.on('room:join', (data, ack) => {
       const reply = fn(ack);
-      const code = String((data && data.code) || '').trim().toUpperCase();
+      data = data || {};
+      const code = String(data.code || '').trim().toUpperCase();
       const room = rooms.get(code);
-      if (!room) return reply({ ok: false, reason: 'Room not found' });
-      if (roomOf.get(socket.id) === code) return reply({ ok: true, code });
-      if (room.phase === 'playing' || room.phase === 'boom') {
-        return reply({ ok: false, reason: 'That game is already in progress' });
-      }
-      if (active(room).length >= CONFIG.MAX_PLAYERS) return reply({ ok: false, reason: 'Room is full' });
+      if (!room) return reply({ ok: false, reason: 'That room no longer exists' });
+      if (sockRoom.get(socket.id) === code) return reply({ ok: true, code });
+      const token = cleanToken(data.token) || crypto.randomBytes(12).toString('hex');
+      const asSpec = live(room) || active(room).length >= CONFIG.MAX_PLAYERS;
+      if (asSpec && room.specs.length >= CONFIG.MAX_SPECTATORS) return reply({ ok: false, reason: 'Room is full' });
       leave(socket);
-      addPlayer(room, socket, data && data.name);
-      reply({ ok: true, code });
+      dropToken(token);
+      attach(room, socket, makeEntry(room, socket, data.name, token), asSpec);
+      reply({ ok: true, code, spec: asSpec });
+      broadcast(room);
+    });
+
+    // Come back after a dropped connection or a page refresh.
+    socket.on('session:resume', (data, ack) => {
+      const reply = fn(ack);
+      const token = cleanToken(data && data.token);
+      const room = token && rooms.get(sessions.get(token));
+      if (!room) return reply({ ok: false });
+      let entry = room.players.find((p) => p.token === token && !p.left);
+      let asSpec = false;
+      if (!entry) {
+        entry = room.specs.find((s) => s.token === token);
+        asSpec = true;
+      }
+      if (!entry) return reply({ ok: false });
+      if (entry.sid && entry.sid !== socket.id && sockRoom.get(entry.sid) === room.code) sockRoom.delete(entry.sid);
+      clearTimeout(entry.graceTimer);
+      entry.graceTimer = null;
+      entry.offline = false;
+      entry.sid = socket.id;
+      sockRoom.set(socket.id, room.code);
+      socket.leave('browse');
+      socket.join(room.code);
+      socket.emit('you', { id: entry.id, token, code: room.code, spec: asSpec });
+      socket.emit('chat:history', room.chat.slice());
+      reply({ ok: true });
       broadcast(room);
     });
 
     socket.on('room:leave', () => leave(socket));
-    socket.on('disconnect', () => leave(socket));
+    socket.on('disconnect', () => goOffline(socket));
 
     socket.on('room:settings', (s) => {
       const room = hostRoom(socket);
@@ -424,33 +632,39 @@ function createGame(io, dict) {
     socket.on('game:lobby', () => {
       const room = hostRoom(socket);
       if (!room || room.phase !== 'over') return;
-      room.phase = 'lobby';
-      room.winnerId = null;
-      room.prompt = '';
-      resetPlayers(room);
+      resetToLobby(room);
       broadcast(room);
     });
 
+    socket.on('chat', (text) => {
+      const { room, player, spec } = locate(socket);
+      const who = player || spec;
+      if (!who) return;
+      const now = Date.now();
+      if (now - who.lastChat < 600) return;
+      const t = cleanChat(text);
+      if (!t) return;
+      who.lastChat = now;
+      pushChat(room, { kind: 'msg', id: who.id, name: who.name, spec: !!spec, text: t, t: now });
+    });
+
     socket.on('typing', (text) => {
-      const room = roomFor(socket);
-      if (!room || room.phase !== 'playing') return;
-      const p = room.players[room.turn];
-      if (!p || p.id !== socket.id) return;
+      const { room, player } = locate(socket);
+      if (!room || !player || room.phase !== 'playing' || room.players[room.turn] !== player) return;
       const t = String(text == null ? '' : text).toLowerCase().replace(/[^a-z]/g, '').slice(0, 30);
-      socket.to(room.code).emit('typing', { id: socket.id, text: t });
+      socket.to(room.code).emit('typing', { id: player.id, text: t });
     });
 
     socket.on('word:submit', (raw, ack) => {
       const reply = fn(ack);
-      const room = roomFor(socket);
+      const { room, player: p } = locate(socket);
       if (!room || room.phase !== 'playing') return reply({ ok: false, reason: 'No bomb right now' });
       const idx = room.turn;
-      const p = room.players[idx];
-      if (!p || p.id !== socket.id) return reply({ ok: false, reason: 'Not your turn' });
+      if (!p || room.players[idx] !== p) return reply({ ok: false, reason: 'Not your turn' });
 
       const now = Date.now();
-      if (now - (socket.data && socket.data.lastSubmit || 0) < 120) return reply({ ok: false, reason: 'Slow down' });
-      if (socket.data) socket.data.lastSubmit = now;
+      if (now - p.lastSubmit < 120) return reply({ ok: false, reason: 'Slow down' });
+      p.lastSubmit = now;
 
       const w = String(raw == null ? '' : raw).trim().toLowerCase();
       if (!/^[a-z]+$/.test(w) || w.length < 3) return reply({ ok: false, reason: 'Too short' });
@@ -476,7 +690,7 @@ function createGame(io, dict) {
     });
   });
 
-  return { rooms, snapshot };
+  return { rooms, sessions, snapshot, listRooms };
 }
 
 /* ------------------------------------------------------------------ */
@@ -487,7 +701,7 @@ async function main() {
   const server = http.createServer((req, res) => {
     const url = (req.url || '/').split('?')[0];
     if (url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
       return res.end('ok');
     }
     // Convenience: if wordbomb.html sits next to this file it is served at /
@@ -501,6 +715,8 @@ async function main() {
   const { Server } = require('socket.io');
   const io = new Server(server, {
     cors: { origin: ORIGIN === '*' ? '*' : ORIGIN.split(',').map((s) => s.trim()) },
+    pingInterval: 10000,
+    pingTimeout: 10000,
   });
   createGame(io, dict);
   server.listen(PORT, () => console.log('[wordbomb] listening on :' + PORT));
