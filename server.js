@@ -153,7 +153,8 @@ function cleanChat(s) {
 
 const SLOTS = ['frame', 'bomb', 'boom', 'title', 'color'];
 const START_COINS = 200;
-const ADMIN_KEY = process.env.ADMIN_KEY || '';
+// Admin password for the owner tools. Better: set the ADMIN_KEY environment variable on your host and change it.
+const ADMIN_KEY = process.env.ADMIN_KEY || 'nexplayadmin1';
 
 // Prices are set here, on the server. The page only knows how each id looks.
 // "exclusive" items cannot be bought: you grant them to specific names from the admin tools.
@@ -203,17 +204,11 @@ const nameKey = (s) => String(s == null ? '' : s).toLowerCase().replace(/\s+/g, 
 const claimable = (s) => { const k = nameKey(s); return k.length >= 2 && k !== 'player'; };
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const safeEqual = (a, b) => crypto.timingSafeEqual(Buffer.from(sha(a)), Buffer.from(sha(b)));
-const normCode = (s) => String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]/g, '');
-function genCode() {
-  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let c = '';
-  for (let i = 0; i < 8; i++) c += A[crypto.randomInt(A.length)];
-  return c.slice(0, 4) + '-' + c.slice(4);
-}
-function newProfile(name, keyHash, code, reserved) {
+// keyHash null = a name an admin gave items to that nobody has claimed yet; the first device to claim it gets them.
+function newProfile(name, keyHash) {
   return {
-    nameKey: nameKey(name), name: cleanName(name), keyHash, recoveryHash: sha(normCode(code)),
-    coins: START_COINS, owned: [], equipped: {}, stats: { games: 0, wins: 0, words: 0 }, reserved: !!reserved,
+    nameKey: nameKey(name), name: cleanName(name), keyHash,
+    coins: START_COINS, owned: [], equipped: {}, stats: { games: 0, wins: 0, words: 0 },
   };
 }
 const publicProfile = (p) => ({ name: p.name, coins: p.coins, owned: p.owned.slice(), equipped: Object.assign({}, p.equipped), stats: Object.assign({}, p.stats) });
@@ -247,14 +242,14 @@ function createStore(opts) {
   const chains = new Map();
 
   const toRow = (p) => ({
-    name_key: p.nameKey, name: p.name, key_hash: p.keyHash, recovery_hash: p.recoveryHash, coins: p.coins,
-    owned: p.owned, equipped: p.equipped, stats: p.stats, reserved: !!p.reserved, updated_at: new Date().toISOString(),
+    name_key: p.nameKey, name: p.name, key_hash: p.keyHash, coins: p.coins,
+    owned: p.owned, equipped: p.equipped, stats: p.stats, updated_at: new Date().toISOString(),
   });
   const fromRow = (r) => ({
-    nameKey: r.name_key, name: r.name, keyHash: r.key_hash || null, recoveryHash: r.recovery_hash || null,
+    nameKey: r.name_key, name: r.name, keyHash: r.key_hash || null,
     coins: Number(r.coins) || 0, owned: Array.isArray(r.owned) ? r.owned : [],
     equipped: r.equipped && typeof r.equipped === 'object' ? r.equipped : {},
-    stats: Object.assign({ games: 0, wins: 0, words: 0 }, r.stats || {}), reserved: !!r.reserved,
+    stats: Object.assign({ games: 0, wins: 0, words: 0 }, r.stats || {}),
   });
 
   if (!useSb && file) {
@@ -331,14 +326,14 @@ async function identify(store, name, key, create) {
   const nk = nameKey(name);
   const kh = sha(key);
   const p = await store.get(nk);
-  if (!p) {
+  if (!p || !p.keyHash) {
+    // free name, or one an admin already gave items to: only an explicit claim binds it to this device
     if (!create) return { guest: true, reason: 'noprofile' };
-    const code = genCode();
-    const np = newProfile(name, kh, code, false);
+    const np = p || newProfile(name, kh);
+    np.keyHash = kh;
     store.save(np);
-    return { profile: np, fresh: true, recovery: code };
+    return { profile: np, fresh: true };
   }
-  if (p.reserved || !p.keyHash) return { guest: true, reason: 'reserved' };
   if (p.keyHash === kh) return { profile: p };
   return { guest: true, reason: 'taken' };
 }
@@ -768,6 +763,7 @@ function createGame(io, dict, store) {
   /* ---------- shop helpers ---------- */
 
   const shopT = new Map();
+  let adminFails = 0, adminLock = 0;
   const throttle = (socket, ms, ev) => {
     const k = socket.id + ':' + ev;
     const now = Date.now();
@@ -803,7 +799,7 @@ function createGame(io, dict, store) {
       if (throttle(socket, 150, 'open')) return reply({ ok: false, reason: 'Slow down' });
       const r = await identSafe(d.name, d.key, !!d.claim); // only an explicit claim creates a profile
       if (r.guest) return reply({ ok: true, guest: true, reason: r.reason, catalog: CATALOG });
-      reply({ ok: true, guest: false, profile: publicProfile(r.profile), fresh: !!r.fresh, recovery: r.recovery || null, catalog: CATALOG });
+      reply({ ok: true, guest: false, profile: publicProfile(r.profile), fresh: !!r.fresh, catalog: CATALOG });
     });
 
     socket.on('profile:buy', async (d, ack) => {
@@ -852,40 +848,18 @@ function createGame(io, dict, store) {
       reply({ ok: true, profile: publicProfile(out.p) });
     });
 
-    // Use a name on a new device (or claim a name an admin reserved for you) with its recovery code.
-    socket.on('profile:recover', async (d, ack) => {
-      const reply = fn(ack);
-      d = d || {};
-      if (throttle(socket, 1000, 'recover')) return reply({ ok: false, reason: 'Wait a second and try again' });
-      const key = cleanToken(d.key);
-      if (!key || !claimable(d.name)) return reply({ ok: false, reason: 'Enter your name first' });
-      const nk = nameKey(d.name);
-      let p;
-      try { p = await store.get(nk); } catch (e) { return reply({ ok: false, reason: 'Could not reach the profile database' }); }
-      if (!p || !p.recoveryHash || sha(normCode(d.code)) !== p.recoveryHash) return reply({ ok: false, reason: 'That code does not match this name' });
-      const out = await store.update(nk, (q) => { q.keyHash = sha(key); q.reserved = false; return null; });
-      reply({ ok: true, profile: publicProfile(out.p) });
-    });
-
-    socket.on('profile:newcode', async (d, ack) => {
-      const reply = fn(ack);
-      d = d || {};
-      if (throttle(socket, 500, 'newcode')) return reply({ ok: false, reason: 'Slow down' });
-      const r = await identSafe(d.name, d.key, false);
-      if (r.guest) return reply({ ok: false, reason: 'Pick a saved name first' });
-      const code = genCode();
-      await store.update(r.profile.nameKey, (q) => { q.recoveryHash = sha(normCode(code)); return null; });
-      reply({ ok: true, recovery: code });
-    });
-
-    // Owner tools: give (or take back) an item or coins for a specific name. A name nobody has used yet becomes
-    // a reserved profile: only someone with the recovery code returned here can claim it.
+    // Owner tools: give or take back items and coins for a name, or release a name so its owner can claim it again
+    // from a new device. A name nobody has claimed yet keeps the items until the first device claims it.
     socket.on('admin:grant', async (d, ack) => {
       const reply = fn(ack);
       d = d || {};
       if (throttle(socket, 300, 'grant')) return reply({ ok: false, reason: 'Slow down' });
-      if (!ADMIN_KEY) return reply({ ok: false, reason: 'ADMIN_KEY is not set on the server' });
-      if (!safeEqual(d.adminKey, ADMIN_KEY)) return reply({ ok: false, reason: 'Wrong admin key' });
+      if (adminLock > Date.now()) return reply({ ok: false, reason: 'Too many wrong tries. Wait a few minutes.' });
+      if (!safeEqual(d.adminKey, ADMIN_KEY)) {
+        if (++adminFails >= 8) { adminFails = 0; adminLock = Date.now() + 10 * 60 * 1000; }
+        return reply({ ok: false, reason: 'Wrong admin password' });
+      }
+      adminFails = 0;
       if (!claimable(d.name)) return reply({ ok: false, reason: 'Enter a name (2+ letters, and not "Player")' });
       const item = d.item ? ITEMS.get(String(d.item)) : null;
       if (d.item && !item) return reply({ ok: false, reason: 'Unknown item' });
@@ -893,12 +867,7 @@ function createGame(io, dict, store) {
       const nk = nameKey(d.name);
       let p;
       try { p = await store.get(nk); } catch (e) { return reply({ ok: false, reason: 'Could not reach the profile database' }); }
-      let recovery = null;
-      if (!p) {
-        recovery = genCode();
-        p = newProfile(d.name, null, recovery, true);
-        store.save(p);
-      }
+      if (!p) { if (d.release) return reply({ ok: false, reason: 'Nobody has saved that name' }); p = newProfile(d.name, null); store.save(p); }
       const out = await store.update(nk, (q) => {
         if (item) {
           if (d.revoke) {
@@ -907,11 +876,11 @@ function createGame(io, dict, store) {
           } else if (!q.owned.includes(item.id)) q.owned.push(item.id);
         }
         if (coins) q.coins = Math.max(0, q.coins + coins);
-        if (d.resetCode) { recovery = genCode(); q.recoveryHash = sha(normCode(recovery)); }
+        if (d.release) q.keyHash = null;
         return null;
       });
       syncLive(out.p);
-      reply({ ok: true, recovery, reserved: !!out.p.reserved, coins: out.p.coins, owned: out.p.owned.length });
+      reply({ ok: true, claimed: !!out.p.keyHash, coins: out.p.coins, owned: out.p.owned.length });
     });
 
     socket.on('room:create', async (data, ack) => {
@@ -1088,7 +1057,7 @@ async function main() {
   const store = createStore();
   console.log('[wordbomb] profiles saved to: ' + store.backend);
   if (store.backend === 'file') console.warn('[wordbomb] Profiles are in a file. On hosts with temporary disks (Render free tier) they are lost on restart. Set SUPABASE_URL and SUPABASE_KEY to keep them permanently.');
-  if (!ADMIN_KEY) console.warn('[wordbomb] ADMIN_KEY is not set, so the admin grant tools are disabled.');
+  if (!process.env.ADMIN_KEY) console.warn('[wordbomb] Using the built-in admin password. Set the ADMIN_KEY environment variable to change it.');
   createGame(io, dict, store);
   server.listen(PORT, () => console.log('[wordbomb] listening on :' + PORT));
 }
